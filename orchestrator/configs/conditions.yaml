@@ -1,0 +1,11 @@
+# Experimental conditions (plan section 7.1). Only `loop` keys differ.
+C0:   # plain autoresearch: 1 plan -> implement -> evaluate; no estimate, no B
+  loop: {K: 1, use_estimator: false, use_belief: false, update_rule: never, selector: first}
+C1:   # K plans, model selects without estimates; no B
+  loop: {K: 4, use_estimator: false, use_belief: false, update_rule: never, selector: model}
+C2:   # K plans -> estimate -> model selects; B shown but always empty
+  loop: {K: 4, use_estimator: true, use_belief: true, update_rule: never, selector: model}
+C3:   # full method: B updated when |e| > tau
+  loop: {K: 4, use_estimator: true, use_belief: true, update_rule: error, selector: model}
+C4:   # B updated every iteration regardless of error
+  loop: {K: 4, use_estimator: true, use_belief: true, update_rule: always, selector: model}

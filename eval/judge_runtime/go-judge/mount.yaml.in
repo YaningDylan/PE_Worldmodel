@@ -1,0 +1,84 @@
+# go-judge v1.11.1 mount config for running the Frontier-CS judge natively (no Docker).
+# = go-judge's built-in default container mount (env/mount_linux.go getDefaultMount, minus
+#   binds whose source does not exist on RHEL 9: /etc/fpc.cfg, /etc/mono, /var/lib/ghc)
+# + a read-only bind of the pinned testlib include dir at /testlib (the Docker image has it at
+#   /lib/testlib; here server.js is started with TESTLIB_INSIDE=/testlib, a supported env var).
+mount:
+  - type: bind
+    source: /bin
+    target: /bin
+    readonly: true
+  - type: bind
+    source: /lib
+    target: /lib
+    readonly: true
+  - type: bind
+    source: /lib64
+    target: /lib64
+    readonly: true
+  - type: bind
+    source: /usr
+    target: /usr
+    readonly: true
+  - type: bind
+    source: /etc/ld.so.cache
+    target: /etc/ld.so.cache
+    readonly: true
+  - type: bind
+    source: /etc/alternatives
+    target: /etc/alternatives
+    readonly: true
+  - type: bind
+    source: /dev/null
+    target: /dev/null
+  - type: bind
+    source: /dev/urandom
+    target: /dev/urandom
+  - type: bind
+    source: /dev/random
+    target: /dev/random
+  - type: bind
+    source: /dev/zero
+    target: /dev/zero
+  - type: bind
+    source: /dev/full
+    target: /dev/full
+  - type: bind
+    source: __TESTLIB_PATH__
+    target: /testlib
+    readonly: true
+  - type: tmpfs
+    target: /w
+    data: size=128m,nr_inodes=4k
+  - type: tmpfs
+    target: /tmp
+    data: size=128m,nr_inodes=4k
+proc: true
+symLink:
+  - linkPath: /dev/fd
+    target: /proc/self/fd
+  - linkPath: /dev/stdin
+    target: /proc/self/fd/0
+  - linkPath: /dev/stdout
+    target: /proc/self/fd/1
+  - linkPath: /dev/stderr
+    target: /proc/self/fd/2
+maskPath:
+  - /sys/firmware
+  - /sys/devices/virtual/powercap
+  - /proc/acpi
+  - /proc/asound
+  - /proc/kcore
+  - /proc/keys
+  - /proc/latency_stats
+  - /proc/timer_list
+  - /proc/timer_stats
+  - /proc/sched_debug
+  - /proc/scsi
+  - /usr/lib/wsl/drivers
+  - /usr/lib/wsl/lib
+workDir: /w
+hostName: go-judge
+domainName: go-judge
+uid: 1536
+gid: 1536

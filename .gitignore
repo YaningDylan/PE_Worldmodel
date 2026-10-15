@@ -1,0 +1,31 @@
+# Python / tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Analysis, reports and experiment outputs
+/analysis/
+/reports/
+/logs/
+/runs/
+/probe/
+/eval/results/
+/serve/smoke_results/
+/eval/summarize_results.py
+
+# Notes and docs: keep only the top-level README and the LLM prompt templates
+*.md
+!/README.md
+!/orchestrator/prompts/*.md
+
+# Judge runtime: downloaded binaries and vendored Frontier-CS copies; keep the mount templates and checksums
+/eval/judge_runtime/*
+!/eval/judge_runtime/upstream_sha256.txt
+!/eval/judge_runtime/go-judge/
+/eval/judge_runtime/go-judge/*
+!/eval/judge_runtime/go-judge/*.yaml.in
+
+# Debug helpers and abandoned container experiments
+/eval/debug/
+/eval/container_attempts/
+/eval/jobs/debug_*.sh

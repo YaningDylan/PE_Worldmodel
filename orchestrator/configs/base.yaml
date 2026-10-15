@@ -1,0 +1,51 @@
+# Base configuration; condition presets in conditions.yaml are merged on top,
+# then CLI --set overrides. The fully resolved config is written to runs/{run_id}/config.yaml.
+run:
+  condition: C3
+  seed: 0
+  budget_T: 30                 # candidate evaluations per run (implementation failures count)
+  init_solution: solutions/baseline_naive.cpp   # relative to PE_ROOT
+  runs_dir: runs               # relative to PE_ROOT
+llm:
+  base_url: http://127.0.0.1:8000/v1
+  model: Qwen/Qwen3.5-9B
+  request_timeout_s: 3600
+  http_retries: 3
+  roles: {}                    # optional per-role {base_url, model} overrides (e.g. a separate Librarian model)
+sampling:
+  # Coding parameters (Qwen3.5 model card: thinking mode, coding tasks) are the default.
+  default: {temperature: 0.6, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 32768, enable_thinking: true}
+  proposer: {temperature: 1.0}
+  # General thinking parameters for the reasoning roles; 16384 cap so runaway thinking fails fast and is
+  # retried (Gate 1: normal calls used 5-8k tokens, runaways burned 32k each).
+  estimator: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5, max_tokens: 16384}
+  selector: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5, max_tokens: 16384}
+  librarian: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5, max_tokens: 16384}
+  implementer: {max_tokens: 49152}
+  implementer_fix: {max_tokens: 49152}
+  implementer_repair: {max_tokens: 49152}
+loop:
+  K: 4                         # candidate plans per iteration
+  use_estimator: true          # Estimator predicts delta_hat per plan
+  use_belief: true             # B shown to Proposer/Estimator/Selector (may be empty)
+  update_rule: error           # never | error (|e| > tau) | always
+  tau: 1.0                     # max(1.0, 3*sigma); measured sigma <= 0.07 even under 2x CPU oversubscription (eval/NOISE.md)
+  selector: model              # model | first
+  history_len: 5               # recent iterations shown to the Proposer
+  max_compile_fixes: 2
+  max_runtime_fixes: 2         # repairs after invalid output / timeout / crash (checker evidence fed back)
+  accept_margin: 0.0           # accept x' iff delta > accept_margin
+  belief_cap: 30
+  init_belief: null            # path to a B json to start from (e.g. a frozen B_27B)
+  librarian_diff_lines: 150    # Librarian sees diff stats, changed functions and this many diff lines
+  parse_retries: 1
+  estimator_parallel: true
+eval:
+  backend: local               # local | judge (shared judge server in the job) | mock
+  judge_url: http://127.0.0.1:8081
+  judge_type: native           # official-docker | native  (tag stored with every result)
+  workers: null                # local backend only: null = all CPUs in this process's affinity mask
+  time_limit_s: 2.0
+  mem_mb: 256
+problem:
+  score_scale: "The submission's score is the average density over the 70 test cases multiplied by 100 (range 0-100)."
