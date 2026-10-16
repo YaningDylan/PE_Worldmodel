@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Short CPU-partition validation of the gate-job scripts before the GPU job is released:
 #   docker/execution-model checks on a cpu node, shared native judge via lib.sh, judge_validate.py,
-#   noise_concurrent.py (small K/reps), loop integration through the judge, and clean judge shutdown.
+#   noise_concurrent.py (small K/reps), and clean judge shutdown.
 # Results: logs/validate_cpu_<jobid>/summary.json
 #SBATCH --job-name=pe_validate_cpu
 #SBATCH --partition=cpu
@@ -44,12 +44,7 @@ PY
 )
 echo "noise check: $NOISE_CHECK"
 
-step "5. loop integration through the judge"
-"$PE_PY" orchestrator/jobs/judge_loop_check.py --url "$PE_JUDGE_URL" --judge-type "$PE_JUDGE_TYPE" \
-  --runs-dir "$OUT/runs" > "$OUT/judge_loop_check.json"
-L=$(rc $?); grep -A13 "\"checks\"" "$OUT/judge_loop_check.json"
-
-step "6. judge shutdown"
+step "5. judge shutdown"
 pe_stop_all; trap - EXIT; sleep 2
 LEFT=$(pgrep -u "$USER" -f "$PE_JUDGE_STATE_DIR" | wc -l)
 S=$([ "$LEFT" -eq 0 ] && echo true || echo false)
@@ -57,6 +52,6 @@ S=$([ "$LEFT" -eq 0 ] && echo true || echo false)
 cat > "$OUT/summary.json" <<EOF
 {"job": "$SLURM_JOB_ID", "node": "$(hostname)", "docker_ok": $PE_DOCKER_OK, "docker_fail": "${PE_DOCKER_FAIL:-}",
  "judge": "$PE_JUDGE_ID", "judge_validate": $V, "noise_script": $N, "noise_check": ${NOISE_CHECK%% *},
- "loop_check": $L, "clean_shutdown": $S}
+ "clean_shutdown": $S}
 EOF
 cat "$OUT/summary.json"

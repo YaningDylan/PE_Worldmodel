@@ -1,12 +1,15 @@
-"""Run directory layout and append-only logs (plan section 5.5).
+"""Run directory layout and append-only logs.
 
 runs/{run_id}/
   config.yaml      resolved config + environment metadata
   calls.jsonl      one line per LLM call (prompt, raw output incl. reasoning, parsed, tokens, latency)
-  iters.jsonl      one line per completed iteration
-  solutions/       every evaluated program ({hash}.cpp) and its evaluation ({hash}.json)
+  iters.jsonl      one line per committed iteration (sampling, every candidate, selection, evaluation, B update)
+  solutions/       every generated program {hash}.cpp, its stage-1 result {hash}.s1.json and full
+                   evaluation {hash}.json
   B/               B_v{version}.json for every version + B_changelog.jsonl
-  state.json       checkpoint after each completed iteration (for resume)
+  db_state.json    program database after the last committed iteration (resume)
+  db_snapshots/    db_it{t}.json every 10 iterations (code replaced by its hash)
+  state.json       checkpoint after each committed iteration (resume)
   summary.json     written at the end
 """
 from __future__ import annotations
@@ -67,11 +70,19 @@ class RunLogger:
         h = code_hash(code)
         (self.sol_dir / f"{h}.cpp").write_text(code)
         if result is not None:
-            (self.sol_dir / f"{h}.json").write_text(
-                json.dumps(result, indent=1, ensure_ascii=False, default=_json_default))
+            self.save_eval(h, result)
         return h
 
+    def save_eval(self, h: str, result: dict, suffix: str = "") -> None:
+        (self.sol_dir / f"{h}{suffix}.json").write_text(
+            json.dumps(result, indent=1, ensure_ascii=False, default=_json_default))
+
+    def load_eval(self, h: str, suffix: str = "") -> dict | None:
+        p = self.sol_dir / f"{h}{suffix}.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
     def write_json(self, name: str, obj) -> None:
+        (self.dir / name).parent.mkdir(parents=True, exist_ok=True)
         tmp = self.dir / (name + ".tmp")
         tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=_json_default))
         os.replace(tmp, self.dir / name)
@@ -88,3 +99,46 @@ class RunLogger:
         if not p.exists():
             return []
         return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+    def truncate_iters(self, t: int) -> None:
+        """Drop iteration records >= t (written by an iteration whose state was not committed)."""
+        p = self.dir / "iters.jsonl"
+        if p.exists():
+            keep = [l for l in p.read_text().splitlines() if l.strip() and json.loads(l)["iteration"] < t]
+            p.write_text("".join(l + "\n" for l in keep))
+
+    # token accounting via the call log
+    def calls_offset(self) -> int:
+        p = self.dir / "calls.jsonl"
+        return p.stat().st_size if p.exists() else 0
+
+    def tokens_since(self, offset: int) -> dict:
+        out = {"tokens_in": 0, "tokens_out": 0, "n_calls": 0}
+        p = self.dir / "calls.jsonl"
+        if p.exists():
+            with open(p) as f:
+                f.seek(offset)
+                for line in f:
+                    if line.strip():
+                        c = json.loads(line)
+                        out["tokens_in"] += c.get("tokens_in", 0)
+                        out["tokens_out"] += c.get("tokens_out", 0)
+                        out["n_calls"] += 1
+        return out
+
+    def calls_by_role(self) -> dict:
+        """Per role: calls, output tokens, runaways (hit max_tokens), parse failures."""
+        out: dict = {}
+        p = self.dir / "calls.jsonl"
+        if not p.exists():
+            return out
+        with open(p) as f:
+            for line in f:
+                if line.strip():
+                    c = json.loads(line)
+                    r = out.setdefault(c["role"], {"calls": 0, "tokens_out": 0, "runaway": 0, "parse_fail": 0})
+                    r["calls"] += 1
+                    r["tokens_out"] += c.get("tokens_out", 0)
+                    r["runaway"] += int(c.get("finish_reason") == "length")
+                    r["parse_fail"] += int(not c.get("parse_ok", True))
+        return out

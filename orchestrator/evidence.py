@@ -1,4 +1,5 @@
-"""Evidence derived from evaluations and code, used in logs, repair prompts and the Librarian's input."""
+"""Evidence derived from evaluations and code: program artifacts (generator / Estimator prompts), per-case
+comparisons, diffs and failure reports (Librarian)."""
 from __future__ import annotations
 
 import difflib
@@ -108,3 +109,44 @@ def failure_report(res: dict, max_cases: int = 5) -> str:
     if ok_sizes:
         lines.append(f"Cases that passed: {len(ok_sizes)} (n from {min(ok_sizes)} to {max(ok_sizes)}).")
     return "\n".join(lines)
+
+
+def _max(cases: list[dict], key: str, fmt: str) -> str:
+    return fmt % max((c.get(key) or 0.0) for c in cases) if cases else "n/a"
+
+
+def artifacts(stage1: dict, full: dict | None = None, log_chars: int = 3000) -> dict:
+    """Artifacts of one evaluated program (OpenEvolve-style merged stage-1 + stage-2 side outputs).
+
+    stage1: result on the stage-1 cases; full: the 70-case result, or None when stage 1 failed."""
+    s1 = stage1.get("per_case") or []
+    bad1 = next((c for c in s1 if c.get("status") != "ok"), None)
+    art = {"stage1_result": f"{stage1.get('status')}: {sum(c.get('status') == 'ok' for c in s1)}/{len(s1)} small "
+                            "cases valid"}
+    if full is None:
+        if stage1.get("status") == "compile_error":
+            art["compile_log"] = (stage1.get("compile_log") or "")[-log_chars:]
+        if bad1:
+            sizes = case_sizes()
+            art["first_failing_case"] = f"case {bad1['case']} (n={sizes.get(bad1['case'], '?')}): {bad1.get('status')}"
+            art["checker_message"] = (bad1.get("msg") or "")[:500] or "(no message)"
+        art["max_runtime_s"] = _max(s1, "time_s", "%.3f")
+        return art
+    cases = full.get("per_case") or []
+    if full.get("status") == "compile_error":
+        art["compile_log"] = (full.get("compile_log") or "")[-log_chars:]
+    ok = [c for c in cases if c.get("status") == "ok" and c.get("ratio") is not None]
+    if ok:
+        sizes = case_sizes()
+        worst = sorted(ok, key=lambda c: c["ratio"])[:5]
+        art["density_summary"] = (f"mean density {sum(c['ratio'] for c in ok) / len(ok):.4f} over {len(ok)} valid "
+                                  "cases; worst 5: " + "; ".join(f"case {c['case']} (n={sizes.get(c['case'], '?')}) "
+                                                                 f"{c['ratio']:.4f}" for c in worst))
+    failed = [c for c in cases if c.get("status") != "ok"]
+    art["checker_failures"] = (
+        "none" if full.get("status") == "ok" else
+        f"{full.get('status')}: {len(failed)}/{len(cases)} cases failed, so the submission scores 0; "
+        + "; ".join(f"case {c['case']} {c['status']}: {(c.get('msg') or '')[:200]}" for c in failed[:5]))
+    art["max_runtime_s"] = _max(cases, "time_s", "%.3f")
+    art["peak_memory_mb"] = _max(cases, "mem_mb", "%.1f")
+    return art

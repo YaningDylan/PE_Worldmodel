@@ -1,28 +1,43 @@
-"""The research loop (plan section 5.2):
+"""OpenEvolve-style search with an optional potential-estimation (PE) gate.
 
-  propose K plans -> estimate delta_hat per plan (reads B_t) -> model selects one ->
-  implement -> evaluate, with <= max_compile_fixes repairs after compile errors and
-  <= max_runtime_fixes repairs after invalid output / timeout / crash -> e = delta - delta_hat ->
-  if the update rule fires, the Librarian edits B (structured ops) -> accept iff delta > margin.
+Iteration t works on island t % num_islands:
+  parent, inspirations = db.sample(island)           (OpenEvolve's storage and sampling, db.py)
+  the Generator prompt is built from them (identical in every condition; B is never shown to the Generator)
+  N candidates: independent generations from that prompt, SEARCH/REPLACE diffs applied to the parent
+  stage 1: compile + the 5 smallest public cases, for every candidate whose diff applied
+  select:  single (vanilla, N = 1) | argmax of the Estimator's delta_hat over stage-1 passers (PE) |
+           random among stage-1 passers; uniform among the generated candidates when none passed stage 1
+  the selected candidate gets the full 70-case evaluation (the budget unit) if it passed stage 1; a stage-1
+  failure is stored with score 0 and its stage-1 artifacts, without a full evaluation
+  db.add(child, island); PE: Librarian when |delta - delta_hat| > tau (delta relative to the parent);
+  db.tick(island)   (generation counter, migration)
+A generation failure (no diff applied) adds nothing. Labeled mode (eval_all): every stage-1 passer also gets a
+full evaluation (not budgeted, never inserted) and a second Estimator call with an empty B; both are only logged.
 
-Implementation failures consume budget but never produce an error e or a B update.
-State is checkpointed after every iteration; re-running with the same run dir resumes.
+Resume: iters.jsonl, db_state.json, B and state.json are written when an iteration commits. An iteration cut
+by the job time limit or by an infrastructure failure (judge or model server) is not committed and is redone.
 """
 from __future__ import annotations
 
-import json
 import os
+import random
 import socket
 import subprocess
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from . import evidence, roles
 from .beliefs import BeliefDoc
 from .config import PE_ROOT, ROLES, resolve_path, sampling_for
-from .roles import RoleRunner, Solution
+from .db import Program, ProgramDB
+from .roles import RoleRunner, stable_seed
 from .runlog import RunLogger, code_hash
+
+
+class InfraError(RuntimeError):
+    """Evaluation infrastructure failed (not the candidate's fault): abort the iteration."""
 
 
 def _git_head(path) -> str | None:
@@ -33,334 +48,311 @@ def _git_head(path) -> str | None:
         return None
 
 
-def _eval_summary(res: dict) -> dict:
-    return {k: res.get(k) for k in ("status", "score", "score_unbounded", "official_score", "n_cases",
-                                    "eval_wall_s", "judge", "sid", "infra_attempts", "status_counts")}
-
-
-RUNTIME_REPAIRABLE = ("invalid", "timeout", "runtime_error")
-
-
 def infra_ids() -> dict:
     """Which job / vLLM server / judge produced a record (several runs share one server and judge)."""
     return {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
             "vllm_server": os.environ.get("PE_VLLM_RUN_DIR"), "vllm_variant": os.environ.get("PE_VLLM_VARIANT"),
             "judge_id": os.environ.get("PE_JUDGE_ID")}
 
 
-class ResearchLoop:
-    def __init__(self, cfg: dict, clients: dict, evaluator, run_dir, problem_text: str | None = None):
-        self.cfg = cfg
-        self.lp = cfg["loop"]
-        self.T = int(cfg["run"]["budget_T"])
+def _eval_summary(res: dict | None) -> dict | None:
+    if res is None:
+        return None
+    return {k: res.get(k) for k in ("status", "score", "official_score", "n_cases", "eval_wall_s", "judge", "sid",
+                                    "infra_attempts", "status_counts")}
+
+
+def _pmap(fn, items, workers=None):
+    items = list(items)
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=workers or len(items)) as ex:
+        return list(ex.map(fn, items))
+
+
+class EvolveLoop:
+    def __init__(self, cfg: dict, clients: dict, stage1_eval, full_eval, run_dir):
+        self.cfg, self.lp = cfg, cfg["loop"]
+        self.seed = int(cfg["run"]["seed"])
         self.log = RunLogger(run_dir)
-        self.evaluator = evaluator
+        self.stage1_eval, self.full_eval = stage1_eval, full_eval
         self.clients = clients
-        if problem_text is None:
-            problem_text = roles.render("problem", score_scale=cfg["problem"]["score_scale"])
-        sampling = {r: sampling_for(cfg, r) for r in ROLES}
-        self.rr = RoleRunner(clients, sampling, self.log, problem_text, int(cfg["run"]["seed"]),
-                             int(self.lp.get("parse_retries", 1)))
-        self.state: dict | None = None
+        problem = roles.render("problem", score_scale=cfg["problem"]["score_scale"])
+        self.rr = RoleRunner(clients, {r: sampling_for(cfg, r) for r in ROLES}, self.log, problem, self.seed,
+                             int(self.lp["parse_retries"]), int(self.lp["max_context_tokens"]))
+        self.db: ProgramDB | None = None
         self.belief: BeliefDoc | None = None
-        self._pending_code: str | None = None
+        self.state: dict | None = None
 
-    # ------------------------------------------------------------ setup / resume
-    def _initial_belief(self) -> BeliefDoc:
-        cap = int(self.lp["belief_cap"])
-        init = resolve_path(self.lp.get("init_belief"))
-        if init is not None:
-            b = BeliefDoc.load(init, cap)
-            return BeliefDoc(b.beliefs, 0, b.next_id, cap)  # re-versioned from 0 for this run
-        return BeliefDoc(cap=cap)
+    # ------------------------------------------------------------------ evaluation
+    def _stage1(self, code: str, tag: str) -> dict:
+        res = self.stage1_eval.evaluate(code, tag=tag)
+        if res.get("status") == "internal_error":
+            raise InfraError(f"stage-1 evaluator failed ({tag}): {(res.get('stderr_tail') or '')[-300:]}")
+        return res
 
+    def _full(self, code: str, tag: str) -> dict:
+        res = self.full_eval.evaluate(code, tag=tag)
+        if res.get("status") == "internal_error":
+            raise InfraError(f"full evaluation failed ({tag}): {(res.get('stderr_tail') or '')[-300:]}")
+        return res
+
+    # ------------------------------------------------------------------ setup / resume
     def setup(self) -> None:
+        cap = int(self.lp["belief_cap"])
         st = self.log.read_json("state.json")
         if st is not None:
             self.state = st
-            self.belief = BeliefDoc.load(self.log.b_dir / f"B_v{st['b_version']}.json",
-                                         int(self.lp["belief_cap"]))
+            self.db = ProgramDB.from_dict(self.log.read_json("db_state.json"), self.seed)
+            self.belief = BeliefDoc.load(self.log.b_dir / f"B_v{st['b_version']}.json", cap)
             self.state["resumes"] = st.get("resumes", 0) + 1
+            self.log.truncate_iters(st["t"])  # records of an iteration that did not commit
             return
-        init_path = resolve_path(self.cfg["run"]["init_solution"])
-        code = init_path.read_text()
-        res = self.evaluator.evaluate(code, tag="init")
-        h = self.log.save_solution(code, res)
-        if res.get("status") != "ok":
-            raise RuntimeError(f"initial solution failed to evaluate: {_eval_summary(res)}")
-        self.belief = self._initial_belief()
+        code = resolve_path(self.cfg["run"]["init_solution"]).read_text()
+        s1 = self._stage1(code, "init_stage1")
+        full = self._full(code, "init")
+        h = self.log.save_solution(code, full)
+        self.log.save_eval(h, s1, ".s1")
+        if s1.get("status") != "ok" or full.get("status") != "ok":
+            raise RuntimeError(f"initial program failed: stage1={s1.get('status')} full={_eval_summary(full)}")
+        self.db = ProgramDB(self.seed, **self.cfg["db"])
+        init = Program(id=self.db.new_id(), code=code, score=float(full["score"]),
+                       artifacts=evidence.artifacts(s1, full), iteration=-1, code_hash=h, eval_hash=h)
+        self.db.add(init, 0)
+        init_b = resolve_path(self.lp.get("init_belief"))
+        self.belief = BeliefDoc.load(init_b, cap) if init_b else BeliefDoc(cap=cap)
+        self.belief = BeliefDoc(self.belief.beliefs, 0, self.belief.next_id, cap)
         self.belief.save(self.log.b_dir)
-        meta = {
-            **infra_ids(), "judge_type": self.cfg["eval"].get("judge_type") if self.cfg["eval"]["backend"] == "judge"
-            else self.cfg["eval"]["backend"],
-            "frontier_cs_commit": _git_head(PE_ROOT / "third_party" / "Frontier-CS"),
-            "llm": {r: c.server_info() for r, c in self.clients.items()},
-            "init_solution_hash": h, "init_score": res["score"],
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        meta = {**infra_ids(), "frontier_cs_commit": _git_head(PE_ROOT / "third_party" / "Frontier-CS"),
+                "repo_commit": _git_head(PE_ROOT), "llm": {r: c.server_info() for r, c in self.clients.items()},
+                "init_hash": h, "init_score": init.score, "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         self.log.write_config({**self.cfg, "meta": meta})
-        self.state = {"step": 0, "best_code": code, "best_hash": h, "best_score": res["score"],
-                      "init_score": res["score"], "b_version": self.belief.version, "history": [],
-                      "tokens_in": 0, "tokens_out": 0, "n_improvements": 0, "n_impl_fail": 0,
-                      "n_b_updates": 0, "resumes": 0, "wall_s": 0.0}
+        self.state = {"t": 0, "full_evals": 0, "best_score": init.score, "init_score": init.score,
+                      "b_version": 0, "tokens_in": 0, "tokens_out": 0, "n_calls": 0, "resumes": 0, "wall_s": 0.0,
+                      "done": False}
+        self._save()
+
+    def _save(self) -> None:
+        self.log.write_json("db_state.json", self.db.to_dict(with_code=True))
         self.log.write_json("state.json", self.state)
 
-    # ------------------------------------------------------------ main loop
-    def run(self, on_iter=None) -> dict:
+    # ------------------------------------------------------------------ main loop
+    def run(self, on_iter=None, deadline: float | None = None) -> dict | None:
+        """Run to the budget. Returns None (run not finished) when `deadline` (epoch seconds) passes: no new
+        iteration is started after it, so a job's time limit does not cut one in the middle."""
         if self.state is None:
             self.setup()
-        while self.state["step"] < self.T:
+        budget, max_iters = int(self.cfg["run"]["full_evals"]), int(self.cfg["run"]["max_iters"])
+        while self.state["full_evals"] < budget and self.state["t"] < max_iters:
+            if deadline is not None and time.time() >= deadline:
+                return None
             t0 = time.time()
-            rec = self.iterate(self.state["step"] + 1)
-            self.state["wall_s"] += time.time() - t0
-            self._commit(rec)
+            rec, child, new_b = self.iterate(self.state["t"])
+            self._commit(rec, child, new_b, time.time() - t0)
             if on_iter is not None:
                 on_iter(rec, self.state)
-        summary = {k: self.state[k] for k in ("step", "best_score", "init_score", "best_hash", "b_version",
-                                              "n_improvements", "n_impl_fail", "n_b_updates",
-                                              "tokens_in", "tokens_out", "wall_s", "resumes")}
-        summary["condition"] = self.cfg["run"]["condition"]
-        summary["seed"] = self.cfg["run"]["seed"]
-        summary["calls_by_role"] = self._calls_by_role()
+        self.state["done"] = True
+        self._save()
+        summary = self.summary()
         self.log.write_json("summary.json", summary)
         return summary
 
-    def _commit(self, rec: dict) -> None:
-        st = self.state
-        self.log.log_iter(rec)
-        st["step"] = rec["iter"]
-        st["tokens_in"] += rec["tokens_in"]
-        st["tokens_out"] += rec["tokens_out"]
-        st["n_impl_fail"] += int(rec["impl_status"] != "ok")
-        st["n_b_updates"] += int(bool(rec["B_updated"]))
-        st["b_version"] = rec["B_version_after"]
-        if rec["accepted"]:
-            st["best_code"] = self._pending_code
-            st["best_hash"] = rec["x_new_hash"]
-            st["best_score"] = rec["f_x_new"]
-            st["n_improvements"] += 1
-        st["history"].append({"iter": rec["iter"], "plan": rec["chosen_plan"], "delta_hat": rec["delta_hat"],
-                              "delta": rec["delta"], "status": rec["impl_status"], "accepted": rec["accepted"]})
-        self.log.write_json("state.json", st)
-
-    # ------------------------------------------------------------ one iteration
-    def iterate(self, step: int) -> dict:
-        lp, st = self.lp, self.state
-        iter_uid = uuid.uuid4().hex[:12]
-        b_before = self.belief.version
-        self.rr.begin(step, b_before, iter_uid)
-        calls_before = self._token_counter()
-        sol = Solution(st["best_code"], st["best_score"])
-        shown_b = self.belief if lp["use_belief"] else None
-        timing = {}
-        K = int(lp["K"])
-
-        # 1. propose
-        t = time.time()
-        hist = st["history"][-int(lp["history_len"]):] if int(lp["history_len"]) > 0 else []
-        plans = roles.propose(self.rr, sol, K, hist, shown_b, show_estimates=lp["use_estimator"])
-        timing["propose_s"] = time.time() - t
-        if not plans:
-            return self._failed_iteration(step, iter_uid, b_before, "no_plans", timing, calls_before)
-
-        # 2. estimate (independently per plan)
-        estimates = None
-        t = time.time()
-        if lp["use_estimator"]:
-            if lp.get("estimator_parallel", True) and len(plans) > 1:
-                with ThreadPoolExecutor(max_workers=len(plans)) as ex:
-                    outs = list(ex.map(lambda ip: roles.estimate(self.rr, sol, ip[1], shown_b, idx=ip[0]),
-                                       enumerate(plans)))
-            else:
-                outs = [roles.estimate(self.rr, sol, p, shown_b, idx=i) for i, p in enumerate(plans)]
-            estimates = {p["id"]: o for p, o in zip(plans, outs)}
-        timing["estimate_s"] = time.time() - t
-        argmax_id = None
-        if estimates:
-            valid = [(e["delta_hat"], pid) for pid, e in estimates.items() if e is not None]
-            if valid:
-                argmax_id = max(valid, key=lambda x: x[0])[1]  # ties -> lowest plan id order kept by max
-
-        # 3. select
-        t = time.time()
-        selection, selector_fallback = None, False
-        if len(plans) == 1 or lp["selector"] == "first":
-            chosen_id = plans[0]["id"]
-        else:
-            selection = roles.select(self.rr, sol, plans, estimates, shown_b, remaining=self.T - step)
-            if selection is None:
-                selector_fallback = True
-                chosen_id = argmax_id or plans[0]["id"]
-            else:
-                chosen_id = selection["chosen_id"]
-        timing["select_s"] = time.time() - t
-        chosen = next(p for p in plans if p["id"] == chosen_id)
-        est = estimates.get(chosen_id) if estimates else None
-        delta_hat = est["delta_hat"] if est else None
-
-        # 4-5. implement (+ repairs) and evaluate
-        t = time.time()
-        impl = self._implement_and_eval(sol, chosen, step)
-        timing["implement_eval_s"] = time.time() - t
-        impl_status, res, code = impl["status"], impl["res"], impl["code"]
-        f_new = res.get("score") if impl_status == "ok" else None
-        case_cmp = evidence.compare_cases(self._load_eval(st["best_hash"]), res) if impl_status == "ok" else None
-        code_diff = (evidence.code_diff(sol.code, code, int(lp.get("librarian_diff_lines", 150)))
-                     if code else None)
-        delta = (f_new - sol.score) if f_new is not None else None
-        e = (delta - delta_hat) if (delta is not None and delta_hat is not None) else None
-        accepted = delta is not None and delta > float(lp["accept_margin"])
-        self._pending_code = code if accepted else None
-
-        rec = {
-            "iter": step, "iter_uid": iter_uid, "x_t_hash": st["best_hash"], "f_x_t": sol.score,
-            "plans": plans, "delta_hats": {pid: (o["delta_hat"] if o else None) for pid, o in estimates.items()}
-            if estimates else None,
-            "estimates": estimates, "chosen_id": chosen_id, "argmax_id": argmax_id,
-            "selector_rationale": selection["rationale"] if selection else None,
-            "selector_fallback": selector_fallback, "chosen_plan": chosen["plan"], "delta_hat": delta_hat,
-            "estimator_reason": est["reason"] if est else None,
-            "relevant_beliefs": est["relevant_beliefs"] if est else None,
-            "impl_status": impl_status, "impl_status_first": impl["first_status"],
-            "n_compile_fixes": impl["n_compile_fixes"], "n_runtime_fixes": impl["n_runtime_fixes"],
-            "repairs": impl["repairs"], "what_changed": impl["what_changed"], "repair_notes": impl["repair_notes"],
-            "x_new_hash": code_hash(code) if code else None, "eval": _eval_summary(res) if res else None,
-            "eval_trace": impl["trace"], "output_identical": case_cmp["identical"] if case_cmp else None,
-            "case_cmp": case_cmp, "code_diff": code_diff,
-            "f_x_new": f_new, "delta": delta, "e": e, "accepted": accepted,
-            "B_version_before": b_before, "infra": infra_ids(),
-        }
-
-        # 6-7. belief update
-        t = time.time()
-        rec.update(self._maybe_update_belief(sol, rec))
-        timing["librarian_s"] = time.time() - t
-        rec["timing"] = {k: round(v, 2) for k, v in timing.items()}
-        rec.update(self._token_counter(since=calls_before))
-        return rec
-
-    def _load_eval(self, h: str) -> dict | None:
-        p = self.log.sol_dir / f"{h}.json"
-        return json.loads(p.read_text()) if p.exists() else None
-
-    def _implement_and_eval(self, sol: Solution, plan: dict, step: int) -> dict:
-        """Implement, evaluate, and repair. The original what_changed is kept; each repair's own
-        summary goes to repair_notes. repairs[i] records what triggered repair i and the status of
-        the evaluation that followed it."""
-        lp = self.lp
-        out = {"status": "no_code", "first_status": "no_code", "res": {}, "code": None, "what_changed": None,
-               "repair_notes": [], "repairs": [], "trace": [], "n_compile_fixes": 0, "n_runtime_fixes": 0}
-        impl = roles.implement(self.rr, sol, plan)
-        if impl is None:
-            return out
-        code = impl["code"]
-        out["what_changed"] = impl["what_changed"]
-        max_c, max_r = int(lp["max_compile_fixes"]), int(lp.get("max_runtime_fixes", 0))
-        while True:
-            res = self.evaluator.evaluate(code, tag=f"it{step}_eval{len(out['trace'])}")
-            h = self.log.save_solution(code, res)
-            out["trace"].append({"hash": h, **_eval_summary(res)})
-            if out["repairs"]:
-                out["repairs"][-1]["status_after"] = res.get("status")
-                out["repairs"][-1]["hash_after"] = h
-            status = res.get("status", "internal_error")
-            if status == "compile_error" and out["n_compile_fixes"] < max_c:
-                kind = "compile"
-                out["n_compile_fixes"] += 1
-            elif status in RUNTIME_REPAIRABLE and out["n_runtime_fixes"] < max_r:
-                kind = "runtime"
-                out["n_runtime_fixes"] += 1
-            else:
-                break
-            idx = len(out["repairs"]) + 1
-            if kind == "compile":
-                fixed = roles.implement_fix(self.rr, plan, code, res.get("compile_log", ""), idx=idx)
-            else:
-                fixed = roles.implement_repair(self.rr, plan, code, evidence.failure_report(res), idx=idx)
-            out["repairs"].append({"attempt": idx, "kind": kind, "trigger_status": status, "trigger_hash": h,
-                                   "trigger_counts": res.get("status_counts"), "parsed": fixed is not None,
-                                   "status_after": None, "hash_after": None})
-            if fixed is None:
-                break
-            out["repair_notes"].append(fixed["what_changed"])
-            code = fixed["code"]
-        out.update(status=status, first_status=out["trace"][0]["status"], res=res, code=code)
-        return out
-
-    def _maybe_update_belief(self, sol: Solution, rec: dict) -> dict:
-        lp = self.lp
-        rule = lp["update_rule"]
-        e = rec["e"]
-        fire = e is not None and (rule == "always" or (rule == "error" and abs(e) > float(lp["tau"])))
-        out = {"librarian_called": False, "B_updated": False, "B_version_after": self.belief.version,
-               "librarian_analysis": None, "belief_ops": None}
-        if not fire:
-            return out
-        lib = roles.librarian(self.rr, sol, self.belief, rec, float(lp["tau"]), rule)
-        out["librarian_called"] = True
-        if lib is None:
-            return out
-        ref = f"{self.cfg['run'].get('run_id', 'run')}/iter{rec['iter']:02d}"
-        new_b, results = self.belief.apply_ops(lib["ops"], step=rec["iter"], evidence_ref=ref)
-        out["librarian_analysis"] = lib["analysis"]
-        out["belief_ops"] = [{"op": op, "result": r} for op, r in zip(lib["ops"], results)]
-        self.log.log_belief_change({"iter": rec["iter"], "iter_uid": rec["iter_uid"],
-                                    "version_before": self.belief.version, "version_after": new_b.version,
-                                    "e": e, "analysis": lib["analysis"], "ops": out["belief_ops"]})
-        if new_b.version != self.belief.version:
+    def _commit(self, rec: dict, child: Program | None, new_b: BeliefDoc | None, wall: float) -> None:
+        st, t = self.state, rec["iteration"]
+        if child is not None:
+            self.db.add(child, rec["island"])
+            rec["migrated"] = self.db.tick(rec["island"])
+        if new_b is not None:
             new_b.save(self.log.b_dir)
+            self.log.log_belief_change(rec["librarian"]["changelog"])
             self.belief = new_b
-            out["B_updated"] = True
-        out["B_version_after"] = self.belief.version
-        return out
+        rec["B_version_after"] = self.belief.version
+        rec["db"] = self.db.health()
+        rec["wall_s"] = round(wall, 2)
+        st["t"] = t + 1
+        st["full_evals"] += rec["budget_used"]
+        st["best_score"] = self.db.best.score
+        st["b_version"] = self.belief.version
+        st["wall_s"] += wall
+        for k in ("tokens_in", "tokens_out", "n_calls"):
+            st[k] += rec["tokens"][k]
+        rec["full_evals_after"], rec["best_score_after"] = st["full_evals"], st["best_score"]
+        self.log.log_iter(rec)
+        self._save()
+        if st["t"] % 10 == 0:
+            self.log.write_json(f"db_snapshots/db_it{st['t']:03d}.json", self.db.to_dict(with_code=False))
 
-    def _failed_iteration(self, step, iter_uid, b_before, status, timing, calls_before) -> dict:
-        self._pending_code = None
-        rec = {"iter": step, "iter_uid": iter_uid, "x_t_hash": self.state["best_hash"],
-               "f_x_t": self.state["best_score"], "plans": None, "delta_hats": None, "estimates": None,
-               "chosen_id": None, "argmax_id": None, "selector_rationale": None, "selector_fallback": False,
-               "chosen_plan": None, "delta_hat": None, "estimator_reason": None, "relevant_beliefs": None,
-               "impl_status": status, "impl_status_first": status, "n_compile_fixes": 0, "n_runtime_fixes": 0,
-               "repairs": [], "what_changed": None, "repair_notes": [], "x_new_hash": None,
-               "eval": None, "eval_trace": [], "output_identical": None, "case_cmp": None, "code_diff": None,
-               "f_x_new": None, "delta": None, "e": None, "accepted": False,
-               "B_version_before": b_before, "librarian_called": False, "B_updated": False,
-               "B_version_after": b_before, "librarian_analysis": None, "belief_ops": None, "infra": infra_ids(),
-               "timing": {k: round(v, 2) for k, v in timing.items()}}
-        rec.update(self._token_counter(since=calls_before))
-        return rec
+    # ------------------------------------------------------------------ one iteration
+    def iterate(self, t: int):
+        lp, db = self.lp, self.db
+        island = t % db.n
+        uid = uuid.uuid4().hex[:12]
+        self.rr.begin(t, self.belief.version, uid)
+        calls_before = self.log.calls_offset()
+        timing: dict[str, float] = {}
+        tick = time.time()
 
-    def _calls_by_role(self) -> dict:
-        """Per role: calls, output tokens, runaways (hit max_tokens), parse failures."""
-        out: dict = {}
-        p = self.log.dir / "calls.jsonl"
-        if not p.exists():
-            return out
-        with open(p) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                c = json.loads(line)
-                r = out.setdefault(c["role"], {"calls": 0, "tokens_out": 0, "runaway": 0, "parse_fail": 0})
-                r["calls"] += 1
-                r["tokens_out"] += c.get("tokens_out", 0)
-                r["runaway"] += int(c.get("finish_reason") == "length")
-                r["parse_fail"] += int(not c.get("parse_ok", True))
-        return out
+        parent, insp, mode = db.sample(island)
+        pc = self.cfg["prompt"]
+        top = db.top(parent.island, int(pc["num_top_programs"]) + int(pc["num_diverse_programs"]))
+        system, user = roles.generator_prompt(self.rr, parent, insp, top, random.Random(stable_seed(
+            self.seed, t, "prompt")), pc)
+        N, max_len = int(lp["N"]), int(pc["max_code_length"])
+        gens = _pmap(lambda i: roles.generate(self.rr, system, user, parent.code, i, max_len), range(N))
+        timing["generate_s"] = time.time() - tick
+        cands = []
+        for i, g in enumerate(gens):
+            c = {"idx": i, **{k: v for k, v in g.items() if k != "code"}, "hash": None, "stage1": None,
+                 "passed": False, "est": None, "est_emptyB": None, "full": None, "delta": None, "selected": False}
+            if g["code"]:
+                c["hash"] = self.log.save_solution(g["code"], None)
+                c["_code"] = g["code"]
+            cands.append(c)
+        applied = [c for c in cands if c["hash"]]
 
-    # token accounting via the call log of the current iteration
-    def _token_counter(self, since: dict | None = None) -> dict:
-        tin = tout = n = 0
-        p = self.log.dir / "calls.jsonl"
-        if p.exists() and since is not None:
-            with open(p) as f:
-                f.seek(since["offset"])
-                for line in f:
-                    if line.strip():
-                        c = json.loads(line)
-                        tin += c.get("tokens_in", 0)
-                        tout += c.get("tokens_out", 0)
-                        n += 1
-            return {"tokens_in": tin, "tokens_out": tout, "n_calls": n}
-        return {"offset": p.stat().st_size if p.exists() else 0}
+        tick = time.time()
+        s1s = _pmap(lambda c: self._stage1(c["_code"], f"it{t}_c{c['idx']}_s1"), applied)
+        for c, r in zip(applied, s1s):
+            self.log.save_eval(c["hash"], r, ".s1")
+            c["_s1"] = r
+            c["stage1"] = {"status": r.get("status"), "status_counts": r.get("status_counts"),
+                           "max_time_s": max((x.get("time_s") or 0) for x in r.get("per_case") or [{}])}
+            c["passed"] = r.get("status") == "ok"
+        passed = [c for c in applied if c["passed"]]
+        timing["stage1_s"] = time.time() - tick
+
+        # Estimator (with the current B, and in labeled mode also with an empty B) + labeled full evaluations
+        tick = time.time()
+        jobs = []
+        if lp["use_estimator"]:
+            empty = BeliefDoc(cap=self.belief.cap)
+            for c in passed:
+                diff = evidence.code_diff(parent.code, c["_code"], int(lp["estimator_diff_lines"]))
+                d = diff["diff"] + ("\n... (diff truncated)" if diff["truncated"] else "")
+                s1txt = "\n".join(f"- {k}: {v}" for k, v in evidence.artifacts(c["_s1"]).items())
+                jobs.append((c, "est", lambda c=c, d=d, s=s1txt: roles.estimate(self.rr, parent, d, s, self.belief,
+                                                                                 c["idx"])))
+                if lp["eval_all"]:
+                    jobs.append((c, "est_emptyB", lambda c=c, d=d, s=s1txt: roles.estimate(
+                        self.rr, parent, d, s, empty, c["idx"], log_role="estimator_emptyB")))
+        if lp["eval_all"]:
+            for c in passed:
+                jobs.append((c, "_full", lambda c=c: self._full(c["_code"], f"it{t}_c{c['idx']}_full")))
+        for (c, key, _), out in zip(jobs, _pmap(lambda j: j[2](), jobs)):
+            c[key] = out
+        for c in passed:
+            if c.get("_full") is not None:
+                self.log.save_eval(c["hash"], c["_full"])
+                sc = float(c["_full"]["score"]) if c["_full"].get("status") == "ok" else 0.0
+                c["full"] = {"status": c["_full"].get("status"), "score": sc}
+                c["delta"] = sc - parent.score
+        timing["estimate_label_s"] = time.time() - tick
+
+        # select
+        rng = random.Random(stable_seed(self.seed, t, "select"))
+        rule = lp["select"]
+        if not applied:
+            pick, how = None, "generation_failure"
+        elif rule == "single":
+            pick, how = applied[0], "single"
+        elif not passed:
+            pick, how = rng.choice(applied), "random_no_stage1_passer"
+        elif rule == "argmax" and any(c["est"] for c in passed):
+            pick, how = max((c for c in passed if c["est"]), key=lambda c: c["est"]["delta_hat"]), "argmax_delta_hat"
+        else:
+            pick, how = rng.choice(passed), ("random" if rule == "random" else "random_no_estimate")
+
+        rec = {"iteration": t, "iter_uid": uid, "island": island, "sampling_mode": mode,
+               "parent": {"id": parent.id, "score": parent.score, "island": parent.island, "status": parent.status,
+                          "migrant": parent.migrant, "hash": parent.code_hash},
+               "inspiration_ids": [p.id for p in insp], "prompt_top_ids": [p.id for p in top],
+               "B_version": self.belief.version, "N": N, "selection_rule": how, "selected_idx": None,
+               "child": None, "delta_hat": None, "delta": None, "e": None, "budget_used": 0,
+               "librarian": {"fired": False}, "migrated": False, "infra": infra_ids()}
+        child, new_b = None, None
+        if pick is not None:
+            pick["selected"] = True
+            rec["selected_idx"] = pick["idx"]
+            tick = time.time()
+            full = None
+            if pick["passed"]:
+                full = pick.get("_full") or self._full(pick["_code"], f"it{t}_c{pick['idx']}_full")
+                self.log.save_eval(pick["hash"], full)
+                rec["budget_used"] = 1
+                score, status = (float(full["score"]) if full.get("status") == "ok" else 0.0), full.get("status")
+            else:
+                score, status = 0.0, pick["_s1"].get("status")
+            timing["full_eval_s"] = time.time() - tick
+            child = Program(id=db.new_id(), code=pick["_code"], score=score,
+                            artifacts=evidence.artifacts(pick["_s1"], full), parent_id=parent.id, island=island,
+                            iteration=t, generation=parent.generation + 1, status=status, changes=pick["changes"],
+                            parent_score=parent.score, code_hash=pick["hash"],
+                            eval_hash=pick["hash"] if full is not None else None)
+            delta = score - parent.score
+            dh = pick["est"]["delta_hat"] if pick["est"] else None
+            rec.update(child={"id": child.id, "hash": child.code_hash, "score": score, "status": status,
+                              "full_eval": _eval_summary(full)},
+                       delta=delta, delta_hat=dh, e=(delta - dh) if dh is not None else None)
+            tick = time.time()
+            new_b = self._maybe_librarian(rec, parent, pick, full)
+            timing["librarian_s"] = time.time() - tick
+        rec["candidates"] = [{k: v for k, v in c.items() if not k.startswith("_")} for c in cands]
+        rec["timing"] = {k: round(v, 2) for k, v in timing.items()}
+        rec["tokens"] = self.log.tokens_since(calls_before)
+        return rec, child, new_b
+
+    def _maybe_librarian(self, rec: dict, parent: Program, pick: dict, full: dict | None) -> BeliefDoc | None:
+        tau = float(self.lp["tau"])
+        if self.lp["update_rule"] != "error" or rec["e"] is None or abs(rec["e"]) <= tau:
+            return None
+        rec["librarian"]["fired"] = True
+        if full is not None and full.get("status") == "ok":
+            par = self.log.load_eval(parent.eval_hash) if parent.eval_hash else None
+            cases = roles.case_evidence_text(evidence.compare_cases(par, full))
+        elif full is not None:
+            cases = evidence.failure_report(full)
+        else:
+            cases = "(no full evaluation)"
+        diff = evidence.code_diff(parent.code, pick["_code"], int(self.lp["librarian_diff_lines"]))
+        sel = {**pick["est"], "delta": rec["delta"], "score": rec["child"]["score"], "status": rec["child"]["status"],
+               "e": rec["e"]}
+        lib = roles.librarian(self.rr, parent, self.belief, sel, tau, cases, roles.code_evidence_text(diff))
+        if lib is None:
+            rec["librarian"]["parse_failed"] = True
+            return None
+        ref = f"{self.cfg['run'].get('run_id', 'run')}/iter{rec['iteration']:03d}"
+        new_b, results = self.belief.apply_ops(lib["ops"], step=rec["iteration"], evidence_ref=ref)
+        ops = [{"op": op, "result": r} for op, r in zip(lib["ops"], results)]
+        rec["librarian"].update(analysis=lib["analysis"], ops=ops, changelog={
+            "iteration": rec["iteration"], "iter_uid": rec["iter_uid"], "version_before": self.belief.version,
+            "version_after": new_b.version, "delta_hat": rec["delta_hat"], "delta": rec["delta"], "e": rec["e"],
+            "analysis": lib["analysis"], "ops": ops})
+        return new_b if new_b.version != self.belief.version else None
+
+    # ------------------------------------------------------------------ summary
+    def summary(self) -> dict:
+        its = self.log.read_iters()
+        modes = Counter(r["sampling_mode"].split("(")[0] for r in its)
+        gen, s1, full, sel = Counter(), Counter(), Counter(), Counter()
+        for r in its:
+            for c in r["candidates"]:
+                gen[c["gen_status"]] += 1
+                if c["stage1"]:
+                    s1[c["stage1"]["status"]] += 1
+            ch = r["child"]
+            sel["generation_failure" if ch is None else
+                "stage1_fail" if ch["full_eval"] is None else f"full_{ch['status']}"] += 1
+        ops = Counter(o["result"]["op"] for r in its for o in (r["librarian"].get("ops") or [])
+                      if o["result"]["ok"])
+        st = self.state
+        return {"condition": self.cfg["run"]["condition"], "seed": self.seed, "iterations": len(its),
+                "full_evals": st["full_evals"], "init_score": st["init_score"], "best_score": st["best_score"],
+                "best_id": self.db.best_id, "best_hash": self.db.best.code_hash,
+                "sampling_modes": dict(modes), "sampling_mode_fractions": {k: round(v / max(1, len(its)), 3)
+                                                                           for k, v in modes.items()},
+                "db": self.db.health(), "candidates_gen_status": dict(gen), "candidates_stage1_status": dict(s1),
+                "selected_outcome": dict(sel), "B_version": st["b_version"],
+                "librarian_calls": sum(r["librarian"]["fired"] for r in its), "belief_ops": dict(ops),
+                "tokens_in": st["tokens_in"], "tokens_out": st["tokens_out"], "n_calls": st["n_calls"],
+                "calls_by_role": self.log.calls_by_role(), "wall_s": round(st["wall_s"], 1),
+                "resumes": st["resumes"]}

@@ -1,7 +1,7 @@
 import pytest
 
 from orchestrator.parsing import ParseError, extract_cpp, extract_json, extract_tag, to_float
-from orchestrator.roles import match_plan_id, parse_estimate, parse_plans
+from orchestrator.roles import parse_estimate, parse_generation
 
 
 def test_extract_json_variants():
@@ -38,10 +38,15 @@ def test_to_float():
 
 
 def test_role_parsers():
-    plans = parse_plans(2)('{"plans": [{"id": "a", "plan": "x"}, {"id": "b", "change": "y", "why": "z"}, '
-                           '{"id": "c", "plan": "w"}]}')
-    assert [p["id"] for p in plans] == ["p1", "p2"] and plans[1]["plan"] == "y z"
-    est = parse_estimate('{"relevant_beliefs": "b001", "delta_hat": "-0.5", "reason": "r"}')
-    assert est == {"relevant_beliefs": ["b001"], "delta_hat": -0.5, "reason": "r"}
-    assert match_plan_id("Plan 2", ["p1", "p2"]) == "p2"
-    assert match_plan_id("p7", ["p1", "p2"]) is None
+    est = parse_estimate('{"cited_beliefs": "b001", "p_valid": 90, "delta_hat": "-0.5", "reason": "r"}')
+    assert est == {"cited_beliefs": ["b001"], "p_valid": 0.9, "delta_hat": -0.5, "reason": "r"}
+    code = "int a = 1;\nint b = 2;\n"
+    ok = parse_generation(code, "x\n<<<<<<< SEARCH\nint b = 2;  \n=======\nint b = 3;\n>>>>>>> REPLACE\n", 100)
+    assert ok["gen_status"] == "ok" and ok["code"] == "int a = 1;\nint b = 3;\n" and ok["n_applied"] == 1
+    assert parse_generation(code, "no diff", 100)["gen_status"] == "no_valid_diff"
+    assert parse_generation(code, "<<<<<<< SEARCH\nint c;\n=======\nint d;\n>>>>>>> REPLACE", 100)["gen_status"] \
+        == "search_not_matching"
+    assert parse_generation(code, "=======\n<<<<<<< SEARCH\nint a = 1;\n=======\nx\n>>>>>>> REPLACE", 100)[
+        "gen_status"] == "no_valid_diff"
+    assert parse_generation(code, "<<<<<<< SEARCH\nint a = 1;\n=======\n" + "x" * 200 + "\n>>>>>>> REPLACE",
+                            100)["gen_status"] == "code_too_long"

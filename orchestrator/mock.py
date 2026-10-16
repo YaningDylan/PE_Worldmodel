@@ -1,7 +1,9 @@
-"""Scripted mock LLM that produces well-formed (and occasionally malformed) role outputs.
+"""Scripted mock LLM for checking the loop without a GPU (`run.py --mock-llm`).
 
-Used by `run.py --mock` and the unit tests to exercise the whole loop without a GPU.
-Implementer programs carry `// MOCK_SCORE=` / `// MOCK_STATUS=` markers read by MockEvaluator.
+Generator: small random SEARCH/REPLACE edits of the current program shown in the prompt (perturb a numeric
+literal, insert comment lines, occasionally a compile-breaking line), plus some responses without a usable
+diff. The edited programs are evaluated for real, so scores and validity change. Estimator / Librarian:
+well-formed (occasionally malformed) JSON.
 """
 from __future__ import annotations
 
@@ -12,59 +14,72 @@ import threading
 
 from .llm import MockLLM
 
-PROGRAM = """#include <bits/stdc++.h>
-// MOCK_SCORE={score:.4f}
-// {status}
-int main() {{ return 0; }}
-"""
+_PROG_RE = re.compile(r"# Current Program\n```cpp\n(.*?)\n```\n\n# Task", re.DOTALL)
+_NUM_RE = re.compile(r"(?<![\w.])(\d+)(?![\w.])")
 
 
-def scripted_llm(seed: int = 0, p_bad_json: float = 0.1, p_compile_error: float = 0.15,
-                 p_invalid: float = 0.05) -> MockLLM:
+def _block(search: str, replace: str) -> str:
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+def scripted_llm(seed: int = 0, p_no_diff: float = 0.08, p_no_match: float = 0.08, p_compile_error: float = 0.08,
+                 p_bad_json: float = 0.1) -> MockLLM:
     rng = random.Random(seed)
     lock = threading.Lock()
+
+    def generator(user: str) -> str:
+        code = _PROG_RE.search(user).group(1)
+        lines = code.split("\n")
+        r = rng.random()
+        if r < p_no_diff:
+            return "The program looks fine; I would keep it as it is."
+        if r < p_no_diff + p_no_match:
+            return "Tweak:\n" + _block("int this_line_does_not_exist = 0;", "int x = 1;")
+        body = [i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith(("//", "#"))
+                and lines.count(ln) == 1]
+        i = rng.choice(body)
+        if r < p_no_diff + p_no_match + p_compile_error:
+            return "Refactor:\n" + _block(lines[i], lines[i] + "\n    this is not C++;")
+        out = []
+        nums = [j for j in body if _NUM_RE.search(lines[j]) and "include" not in lines[j]]
+        if nums and rng.random() < 0.7:
+            j = rng.choice(nums)
+            ms = list(_NUM_RE.finditer(lines[j]))
+            m = rng.choice(ms)
+            v = int(m.group(1))
+            nv = max(0, v + rng.choice([-2, -1, 1, 2, max(1, v // 4)]))
+            out.append(_block(lines[j], lines[j][:m.start()] + str(nv) + lines[j][m.end():]))
+        if not out or rng.random() < 0.5:
+            k = rng.choice(body)
+            note = "\n".join(f"    // mock note {rng.randint(0, 10**6)}" + "." * rng.randint(0, 60)
+                             for _ in range(rng.randint(1, 12)))
+            if all(lines[k] not in b for b in out):
+                out.append(_block(lines[k], lines[k] + "\n" + note))
+        return "Here are my changes.\n\n" + "\n".join(out)
 
     def respond(tag, messages):
         user = messages[-1]["content"]
         with lock:
-            r = rng.random()
-            if tag in ("proposer", "estimator", "selector", "librarian") and r < p_bad_json:
-                return "Sorry, here is my answer: plans are p1 and p2."  # unparseable
-            if tag == "proposer":
-                k = int(re.search(r"Propose (\d+) candidate", user).group(1))
-                return json.dumps({"plans": [{"id": f"p{i + 1}", "plan": f"mock plan {rng.randint(0, 9999)}"}
-                                             for i in range(k)]})
-            if tag == "estimator":
-                ids = re.findall(r'"id": "(b\d+)"', user)
-                rel = rng.sample(ids, min(len(ids), rng.randint(0, 2)))
-                return json.dumps({"relevant_beliefs": rel, "delta_hat": round(rng.uniform(-2, 3), 2),
-                                   "reason": "mock reason"})
-            if tag == "selector":
-                ids = re.findall(r"^### (p\d+)$", user, re.M)
-                return "```json\n" + json.dumps({"chosen_id": rng.choice(ids), "rationale": "mock"}) + "\n```"
-            if tag in ("implementer", "implementer_fix", "implementer_repair"):
-                m = re.search(r"Current solution \(score ([-0-9.]+)\)", user)
-                base = float(m.group(1)) if m else 50.0
-                status = "MOCK_STATUS=ok"
-                if tag == "implementer" and r < p_compile_error:
-                    status = "MOCK_STATUS=compile_error"
-                elif tag == "implementer" and r > 1 - p_invalid:
-                    status = "MOCK_STATUS=invalid"
-                code = PROGRAM.format(score=base + rng.gauss(0.3, 2.0), status=status)
-                return f"<what_changed>mock change</what_changed>\n```cpp\n{code}```"
+            if tag == "generator":
+                return generator(user)
+            if rng.random() < p_bad_json:
+                return "I am not sure; maybe +1."  # unparseable
+            ids = re.findall(r'"id": "(b\d+)"', user)
+            if tag in ("estimator", "estimator_emptyB"):
+                return json.dumps({"cited_beliefs": rng.sample(ids, min(len(ids), rng.randint(0, 2))),
+                                   "p_valid": round(rng.uniform(0.5, 1.0), 2),
+                                   "delta_hat": round(rng.uniform(-2, 3), 2), "reason": "mock reason"})
             if tag == "librarian":
-                ids = re.findall(r'"id": "(b\d+)"', user)
-                ops = [{"op": "ADD", "statement": f"mock belief {rng.randint(0, 999)}",
-                        "conditions": "always", "predicted_effect": "+1", "confidence": 0.5,
-                        "evidence": "for", "reason": "mock"}]
+                ops = [{"op": "ADD", "statement": f"mock belief {rng.randint(0, 999)}", "conditions": "always",
+                        "predicted_effect": "+1", "confidence": 0.5, "evidence": "for", "reason": "mock"}]
                 if ids:
                     ops.append({"op": "UPDATE", "id": rng.choice(ids), "confidence": round(rng.random(), 2),
                                 "evidence": "against", "reason": "mock"})
                 if len(ids) >= 2 and rng.random() < 0.3:
                     ops.append({"op": "MERGE", "ids": ids[:2], "statement": "merged", "conditions": "c",
                                 "predicted_effect": "0", "confidence": 0.4, "reason": "mock"})
-                if rng.random() < 0.2:
-                    ops.append({"op": "DELETE", "id": "b999", "reason": "invalid id on purpose"})
+                if len(ids) >= 25:
+                    ops.append({"op": "DELETE", "id": ids[0], "reason": "keep the document under the cap"})
                 return json.dumps({"analysis": "mock analysis", "ops": ops})
             raise ValueError(f"unknown tag {tag}")
 

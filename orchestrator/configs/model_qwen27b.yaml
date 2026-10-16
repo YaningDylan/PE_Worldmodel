@@ -1,20 +1,14 @@
-# Overlay for the 27B runs (Qwen3.8-27B; Qwen3.6-27B as fallback). Both model cards recommend the same
-# thinking-mode sampling for every use: temperature 1.0, top_p 0.95, top_k 20, presence_penalty 0.0
-# (min_p 0, repetition_penalty 1.0 are vLLM defaults).
-# reasoning_effort=medium (user decision 2026-10-14): at the template default (xhigh) every Implementer call
-# of the first main27b attempt thought until its 49152-token cap and produced no code, and the reasoning
-# roles often hit 16384. Caps raised moderately: reasoning roles 24576, Implementer + repairs 65536.
+# Overlay for the 27B runs (Qwen3.8-27B). Model card, thinking mode: temperature 1.0, top_p 0.95, top_k 20,
+# presence_penalty 0.0 for every use. reasoning_effort=medium for all roles (user decision 2026-10-14: at the
+# template default, xhigh, every code-writing call thought until its cap). Caps as in the previous 27B runs:
+# the code-writing role (here the Generator) 65536, the reasoning roles 24576.
 llm:
   model: Qwen/Qwen3.8-27B        # the job overrides this with the model the server actually loaded
 sampling:
   default: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 32768, enable_thinking: true,
             reasoning_effort: medium}
-  proposer: {temperature: 1.0}
-  estimator: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 24576}
-  selector: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 24576}
-  librarian: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 24576}
-  implementer: {temperature: 1.0, presence_penalty: 0.0, max_tokens: 65536}
-  implementer_fix: {temperature: 1.0, presence_penalty: 0.0, max_tokens: 65536}
-  implementer_repair: {temperature: 1.0, presence_penalty: 0.0, max_tokens: 65536}
+  generator: {max_tokens: 65536}
+  estimator: {max_tokens: 24576}
+  librarian: {max_tokens: 24576}
 eval:
   backend: judge

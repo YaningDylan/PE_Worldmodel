@@ -1,6 +1,6 @@
 {{problem}}
 
-## Solution before this iteration (score {{score}})
+## Parent program (score {{score}})
 ```cpp
 {{code}}
 ```
@@ -9,18 +9,17 @@
 {{beliefs}}
 
 ## What happened this iteration
-- Plan: {{plan}}
-- Implementer's summary of what changed: {{what_changed}}
-- Predicted delta (delta_hat): {{delta_hat}}
+- A candidate modification of the parent program was generated (diff below) and evaluated.
+- Predicted delta (delta_hat): {{delta_hat}}; predicted probability that the full evaluation is valid: {{p_valid}}
 - Estimator's reasoning: {{estimator_reason}}
 - Beliefs the estimator cited: {{cited_beliefs}}
-- Actual delta: {{delta}} (score {{score}} -> {{new_score}})
+- Actual delta: {{delta}} (score {{score}} -> {{new_score}}; full evaluation status: {{status}})
 - Prediction error e = delta - delta_hat = {{error}}{{trigger_note}}
 
 ## Evidence from the evaluation (70 test cases)
 {{case_evidence}}
 
-## Code change (new program vs. the solution above)
+## Code change (candidate vs. the parent program above)
 {{code_evidence}}
 
 ## Task
@@ -28,7 +27,7 @@ You maintain the belief document. Its purpose is to make FUTURE predictions of s
 
 Rules:
 - Each belief must be falsifiable: under which conditions, which kind of modification, what expected effect on the score (with a magnitude, in score points).
-- Prefer general lessons about kinds of modifications over facts about this single plan.
+- Prefer general lessons about kinds of modifications over facts about this single change.
 - At most {{cap}} beliefs in total (currently {{n_beliefs}}); MERGE or DELETE before adding when the document is nearly full.
 - "evidence" says whether this iteration supports ("for") or contradicts ("against") the belief.
 

@@ -1,51 +1,60 @@
-# Base configuration; condition presets in conditions.yaml are merged on top,
-# then CLI --set overrides. The fully resolved config is written to runs/{run_id}/config.yaml.
+# Base configuration; condition presets in conditions.yaml are merged on top, then an optional --config
+# overlay, then CLI --set overrides. The resolved config is written to runs/{run_id}/config.yaml.
 run:
-  condition: C3
+  condition: vanilla
   seed: 0
-  budget_T: 30                 # candidate evaluations per run (implementation failures count)
-  init_solution: solutions/baseline_naive.cpp   # relative to PE_ROOT
+  full_evals: 100              # budget: full (70-case) evaluations of inserted children
+  max_iters: 300               # hard cap on iterations (generation failures and stage-1 failures use no budget)
+  init_solution: solutions/baseline_naive.cpp   # relative to PE_ROOT (same initial program as the 27B runs)
   runs_dir: runs               # relative to PE_ROOT
 llm:
   base_url: http://127.0.0.1:8000/v1
-  model: Qwen/Qwen3.5-9B
+  model: Qwen/Qwen3.8-27B
   request_timeout_s: 3600
   http_retries: 3
-  roles: {}                    # optional per-role {base_url, model} overrides (e.g. a separate Librarian model)
+  roles: {}                    # optional per-role {base_url, model} overrides
 sampling:
-  # Coding parameters (Qwen3.5 model card: thinking mode, coding tasks) are the default.
-  default: {temperature: 0.6, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 32768, enable_thinking: true}
-  proposer: {temperature: 1.0}
-  # General thinking parameters for the reasoning roles; 16384 cap so runaway thinking fails fast and is
-  # retried (Gate 1: normal calls used 5-8k tokens, runaways burned 32k each).
-  estimator: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5, max_tokens: 16384}
-  selector: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5, max_tokens: 16384}
-  librarian: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5, max_tokens: 16384}
-  implementer: {max_tokens: 49152}
-  implementer_fix: {max_tokens: 49152}
-  implementer_repair: {max_tokens: 49152}
+  default: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, max_tokens: 32768, enable_thinking: true}
+  generator: {}
+  estimator: {}
+  librarian: {}
+db:                            # OpenEvolve v0.4.0 defaults except num_islands, archive_size, migration_interval
+  num_islands: 3
+  feature_bins: 10
+  archive_size: 20
+  exploration_ratio: 0.2
+  exploitation_ratio: 0.7
+  elite_selection_ratio: 0.1
+  migration_interval: 10
+  migration_rate: 0.1
+  diversity_reference_size: 20
+  num_inspirations: 2          # OpenEvolve: prompt.num_diverse_programs
+prompt:                        # OpenEvolve v0.4.0 prompt defaults (max_code_length raised for C++)
+  num_top_programs: 3
+  num_diverse_programs: 2
+  max_code_length: 60000
+  suggest_simplification_after_chars: 500
+  max_artifact_chars: 20480
 loop:
-  K: 4                         # candidate plans per iteration
-  use_estimator: true          # Estimator predicts delta_hat per plan
-  use_belief: true             # B shown to Proposer/Estimator/Selector (may be empty)
-  update_rule: error           # never | error (|e| > tau) | always
-  tau: 1.0                     # max(1.0, 3*sigma); measured sigma <= 0.07 even under 2x CPU oversubscription (eval/NOISE.md)
-  selector: model              # model | first
-  history_len: 5               # recent iterations shown to the Proposer
-  max_compile_fixes: 2
-  max_runtime_fixes: 2         # repairs after invalid output / timeout / crash (checker evidence fed back)
-  accept_margin: 0.0           # accept x' iff delta > accept_margin
+  N: 1                         # candidates generated per iteration from the same prompt
+  select: single               # single (N=1) | argmax (highest delta_hat among stage-1 passers) | random
+  use_estimator: false
+  update_rule: never           # never | error (Librarian when |delta - delta_hat| > tau)
+  eval_all: false              # labeled mode: full evaluation of every stage-1 passer + empty-B estimates (logged only)
+  tau: 1.0
   belief_cap: 30
-  init_belief: null            # path to a B json to start from (e.g. a frozen B_27B)
-  librarian_diff_lines: 150    # Librarian sees diff stats, changed functions and this many diff lines
-  parse_retries: 1
-  estimator_parallel: true
+  init_belief: null            # path to a B json to start from
+  parse_retries: 1             # Estimator / Librarian; the Generator is never retried
+  estimator_diff_lines: 600
+  librarian_diff_lines: 150
+  max_context_tokens: 131072   # vLLM --max-model-len; max_tokens is reduced for long prompts
 eval:
-  backend: local               # local | judge (shared judge server in the job) | mock
+  backend: local               # full evaluation: local | judge (shared judge server in the job)
   judge_url: http://127.0.0.1:8081
-  judge_type: native           # official-docker | native  (tag stored with every result)
+  judge_type: native
   workers: null                # local backend only: null = all CPUs in this process's affinity mask
   time_limit_s: 2.0
   mem_mb: 256
+  stage1_cases: [43, 68, 59, 57, 29]   # the 5 smallest public cases (n = 104-108); local judge replica
 problem:
   score_scale: "The submission's score is the average density over the 70 test cases multiplied by 100 (range 0-100)."

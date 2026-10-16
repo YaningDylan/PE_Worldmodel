@@ -13,8 +13,9 @@ PKG_DIR = Path(__file__).resolve().parent
 PE_ROOT = Path(os.environ.get("PE_ROOT", PKG_DIR.parent)).resolve()
 CONFIG_DIR = PKG_DIR / "configs"
 
-ROLES = ("proposer", "estimator", "selector", "implementer", "implementer_fix", "implementer_repair", "librarian")
-UPDATE_RULES = ("never", "error", "always")
+ROLES = ("generator", "estimator", "librarian")
+SELECT_RULES = ("single", "argmax", "random")
+UPDATE_RULES = ("never", "error")
 
 
 def deep_merge(base: dict, over: dict) -> dict:
@@ -58,14 +59,16 @@ def load_config(condition: str | None = None, overrides: list[str] | None = None
 
 def validate(cfg: dict) -> None:
     lp = cfg["loop"]
+    if lp["select"] not in SELECT_RULES:
+        raise ValueError(f"loop.select must be one of {SELECT_RULES}")
     if lp["update_rule"] not in UPDATE_RULES:
         raise ValueError(f"loop.update_rule must be one of {UPDATE_RULES}")
-    if lp["update_rule"] != "never" and not (lp["use_belief"] and lp["use_estimator"]):
-        raise ValueError("updating B requires use_belief and use_estimator")
-    if lp["selector"] not in ("model", "first"):
-        raise ValueError("loop.selector must be 'model' or 'first'")
-    if int(lp["K"]) < 1 or int(cfg["run"]["budget_T"]) < 1:
-        raise ValueError("K and budget_T must be >= 1")
+    if int(lp["N"]) < 1 or (lp["select"] == "single") != (int(lp["N"]) == 1):
+        raise ValueError("loop.N must be >= 1, and select=single iff N=1")
+    if (lp["select"] == "argmax" or lp["update_rule"] != "never" or lp["eval_all"]) and not lp["use_estimator"]:
+        raise ValueError("select=argmax, update_rule=error and eval_all need use_estimator")
+    if int(cfg["run"]["full_evals"]) < 1 or int(cfg["run"]["max_iters"]) < 1:
+        raise ValueError("run.full_evals and run.max_iters must be >= 1")
     if float(lp["tau"]) < 0:
         raise ValueError("tau must be >= 0")
 

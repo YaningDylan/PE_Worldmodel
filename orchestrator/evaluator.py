@@ -1,4 +1,5 @@
-"""Evaluator adapters: the local judge-compatible evaluator (eval/local_eval.py) and a mock."""
+"""Evaluator adapters: the local judge-compatible evaluator (eval/local_eval.py, also used on a case subset for
+the stage-1 check), the shared judge server, and a mock."""
 from __future__ import annotations
 
 import importlib.util
@@ -22,9 +23,10 @@ def _load_local_eval():
 
 
 class LocalEvaluator:
-    def __init__(self, workers: int | None = None, time_limit_s: float = 2.0, mem_mb: int = 256):
+    def __init__(self, workers: int | None = None, time_limit_s: float = 2.0, mem_mb: int = 256,
+                 cases: list[int] | None = None):
         self.mod = _load_local_eval()
-        self.kw = {"workers": workers, "time_limit_s": time_limit_s, "mem_mb": mem_mb}
+        self.kw = {"workers": workers, "time_limit_s": time_limit_s, "mem_mb": mem_mb, "cases": cases}
 
     def evaluate(self, code: str, tag: str | None = None) -> dict:
         res: dict = {}
