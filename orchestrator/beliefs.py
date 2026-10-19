@@ -3,17 +3,38 @@
 The Librarian never rewrites B directly; it emits a list of operations
 (ADD / UPDATE / MERGE / DELETE) that this module validates and applies.
 Every successful update bumps the version by one.
+
+A belief is one short, general, falsifiable claim: statement <= 200 characters, conditions <= 150, and
+predicted_effect a score change in points (e.g. "+1 to +3"). Analysis stays in the Librarian's changelog; a
+concrete measurement may be attached to the evidence reference as a short note, which is stored but not
+shown in prompts.
 """
 from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 EDITABLE_FIELDS = ("statement", "conditions", "predicted_effect", "confidence")
 OPS = ("ADD", "UPDATE", "MERGE", "DELETE")
 EVIDENCE_KINDS = ("for", "against")
+MAX_CHARS = {"statement": 200, "conditions": 150, "predicted_effect": 40, "evidence_note": 150}
+_EFFECT_RE = re.compile(r"[-+]?\d+(\.\d+)?")
+
+
+def check_fields(op: dict) -> list[str]:
+    """Format violations of the text fields present in an op (empty list = ok)."""
+    errs = []
+    for k, lim in MAX_CHARS.items():
+        v = op.get(k)
+        if isinstance(v, str) and len(v.strip()) > lim:
+            errs.append(f"'{k}' has {len(v.strip())} characters (max {lim})")
+    eff = op.get("predicted_effect")
+    if isinstance(eff, str) and eff.strip() and not _EFFECT_RE.search(eff):
+        errs.append("'predicted_effect' must be a score change in points, e.g. '+1 to +3'")
+    return errs
 
 
 def _clamp_conf(x: Any) -> float:
@@ -129,6 +150,9 @@ class BeliefDoc:
                     raise ValueError(f"unknown op '{op.get('op')}'")
                 if not _opt_str(op, "reason"):
                     res["warning"] = "missing reason"
+                errs = check_fields(op) if kind != "DELETE" else []
+                if errs:
+                    raise ValueError("; ".join(errs))
                 res["id"] = getattr(new, f"_op_{kind.lower()}")(op, step, evidence_ref)
                 res["ok"] = True
             except (ValueError, TypeError, KeyError) as e:
@@ -137,6 +161,11 @@ class BeliefDoc:
         if any(r["ok"] for r in results):
             new.version = self.version + 1
         return new, results
+
+    @staticmethod
+    def _ref(op: dict, ref: str) -> str:
+        note = _opt_str(op, "evidence_note")
+        return f"{ref}: {note}" if note else ref
 
     def _evidence(self, op: dict) -> str | None:
         ev = op.get("evidence")
@@ -157,8 +186,8 @@ class BeliefDoc:
             "conditions": _opt_str(op, "conditions"),
             "predicted_effect": _req_str(op, "predicted_effect"),
             "confidence": _clamp_conf(op.get("confidence", 0.5)),
-            "evidence_for": [ref] if ev == "for" else [],
-            "evidence_against": [ref] if ev == "against" else [],
+            "evidence_for": [self._ref(op, ref)] if ev == "for" else [],
+            "evidence_against": [self._ref(op, ref)] if ev == "against" else [],
             "created_at": step,
             "updated_at": step,
         }
@@ -180,8 +209,8 @@ class BeliefDoc:
         if not changes and ev is None:
             raise ValueError("UPDATE changes nothing")
         b.update(changes)
-        if ev is not None and ref not in b[f"evidence_{ev}"]:
-            b[f"evidence_{ev}"].append(ref)
+        if ev is not None and not any(e.split(": ")[0] == ref for e in b[f"evidence_{ev}"]):
+            b[f"evidence_{ev}"].append(self._ref(op, ref))
         b["updated_at"] = step
         return bid
 
@@ -198,10 +227,10 @@ class BeliefDoc:
         ev = self._evidence(op)
         ev_for = list(dict.fromkeys(e for b in olds for e in b.get("evidence_for", [])))
         ev_against = list(dict.fromkeys(e for b in olds for e in b.get("evidence_against", [])))
-        if ev == "for" and ref not in ev_for:
-            ev_for.append(ref)
-        if ev == "against" and ref not in ev_against:
-            ev_against.append(ref)
+        if ev == "for" and not any(e.split(": ")[0] == ref for e in ev_for):
+            ev_for.append(self._ref(op, ref))
+        if ev == "against" and not any(e.split(": ")[0] == ref for e in ev_against):
+            ev_against.append(self._ref(op, ref))
         merged = {
             "id": None,
             "statement": _req_str(op, "statement"),

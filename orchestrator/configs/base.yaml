@@ -21,7 +21,7 @@ sampling:
 db:                            # OpenEvolve v0.4.0 defaults except num_islands, archive_size, migration_interval
   num_islands: 3
   feature_bins: 10
-  archive_size: 20
+  archive_size: 3              # small elite set for a 100-evaluation budget (exploitation samples these)
   exploration_ratio: 0.2
   exploitation_ratio: 0.7
   elite_selection_ratio: 0.1

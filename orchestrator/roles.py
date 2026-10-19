@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .beliefs import BeliefDoc
+from .beliefs import BeliefDoc, check_fields
 from .db import Program
 from .llm import Sampling
 from .parsing import ParseError, extract_json, strip_think, to_float
@@ -78,10 +78,11 @@ class RoleRunner:
         est_in = (len(system) + len(user)) // 3
         sampling = dataclasses.replace(self.sampling[role], max_tokens=min(
             self.sampling[role].max_tokens, self.max_context - est_in - 512))
-        resp = None
+        resp, err = None, ""
         for attempt in range((self.parse_retries if retries is None else retries) + 1):
             content = user if attempt == 0 else (
-                user + "\n\n(Your previous answer could not be parsed. Answer strictly in the requested output format.)")
+                user + f"\n\n(Your previous answer could not be used: {err}. Answer strictly in the requested "
+                "output format.)")
             messages = [{"role": "system", "content": system}, {"role": "user", "content": content}]
             seed = stable_seed(self.run_seed, self.step, log_role, idx, attempt)
             rec = {"role": log_role, "iter": self.step, "iter_uid": self.iter_uid, "idx": idx, "attempt": attempt,
@@ -106,6 +107,7 @@ class RoleRunner:
                 self.logger.log_call({**rec, "parse_ok": True, "parse_error": None, "parsed": parsed})
                 return parsed, resp
             except (ParseError, ValueError, KeyError, TypeError) as e:
+                err = str(e)[:1000]
                 self.logger.log_call({**rec, "parse_ok": False, "parse_error": f"{type(e).__name__}: {e}",
                                       "parsed": None})
         return None, resp
@@ -326,11 +328,18 @@ def estimate(rr: RoleRunner, parent: Program, diff: str, stage1_text: str, belie
     return est
 
 
-def parse_librarian(text: str) -> dict:
+def parse_librarian(text: str, strict: bool = True) -> dict:
+    """strict: reject the answer if any op breaks the belief format (the retry tells the Librarian why)."""
     obj = extract_json(text)
     ops = obj.get("ops", [])
     if not isinstance(ops, list):
         raise ParseError("'ops' must be a list")
+    if strict:
+        errs = [f"op {i} ({op.get('op')}): {'; '.join(e)}" for i, op in enumerate(ops) if isinstance(op, dict)
+                and str(op.get("op", "")).upper() != "DELETE" and (e := check_fields(op))]
+        if errs:
+            raise ParseError("belief format violated - " + " | ".join(errs) + ". Keep each belief one short general "
+                             "claim; put the analysis in 'analysis' and measurements in 'evidence_note'")
     return {"analysis": str(obj.get("analysis", "")).strip(), "ops": ops}
 
 
@@ -368,5 +377,11 @@ def librarian(rr: RoleRunner, parent: Program, belief: BeliefDoc, sel: dict, tau
                   delta=fmt_delta(sel["delta"]), new_score=fmt_score(sel["score"]), status=sel["status"],
                   error=fmt_delta(sel["e"]), trigger_note=f" (|e| > tau = {tau:g}: the prediction was significantly off)",
                   case_evidence=case_evidence, code_evidence=code_evidence, cap=belief.cap, n_beliefs=len(belief))
-    lib, _ = rr.call("librarian", user, parse_librarian)
+    lib, resp = rr.call("librarian", user, parse_librarian)
+    if lib is None and resp is not None:  # still violating after the retry: apply its well-formed ops only
+        try:
+            lib = parse_librarian(resp.content, strict=False)
+            lib["format_violation"] = True
+        except (ParseError, ValueError):
+            lib = None
     return lib
