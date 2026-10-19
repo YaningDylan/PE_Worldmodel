@@ -1,6 +1,6 @@
 # Source me: shared paths/caches for the potential-estimation project.
 export PE_ROOT=/work/mit/ppliang_mit/yaning/workspace/potential_estimation
-export PE_SCRATCH=/work/mit/ppliang_mit/yaning/workspace/pe_scratch
+export PE_SCRATCH=$PE_ROOT/pe_scratch   # caches, model weights, vLLM image (git-ignored)
 export PE_PY=/work/mit/ppliang_mit/yaning/workspace/envs/pe/bin/python
 export VLLM_ENV=/home/dvdai_mit/miniconda3/envs/ocrvl          # vLLM 0.22.1 / torch 2.11 cu130 (read-only reuse)
 export FRONTIER_DIR=$PE_ROOT/third_party/Frontier-CS

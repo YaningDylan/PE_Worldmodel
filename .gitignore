@@ -29,3 +29,6 @@ __pycache__/
 /eval/debug/
 /eval/container_attempts/
 /eval/jobs/debug_*.sh
+
+# Caches, model weights and the vLLM image (see env.sh)
+/pe_scratch/

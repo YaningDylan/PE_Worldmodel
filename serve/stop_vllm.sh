@@ -4,7 +4,7 @@
 #                              ($PE_SCRATCH/vllm_current_$SLURM_JOB_ID)
 # Can also be sourced to get a `pe_stop_vllm [RUN_DIR]` function.
 pe_stop_vllm() {
-  local scratch=/work/mit/ppliang_mit/yaning/workspace/pe_scratch
+  local scratch=${PE_SCRATCH:-/work/mit/ppliang_mit/yaning/workspace/potential_estimation/pe_scratch}
   local run_dir=${1:-$(cat "$scratch/vllm_current_${SLURM_JOB_ID:-nojob}" 2>/dev/null)}
   [ -n "$run_dir" ] && [ -f "$run_dir/vllm.pid" ] || { echo "[stop_vllm] no run dir / pid file (${run_dir:-unset})" >&2; return 1; }
   local pid; pid=$(cat "$run_dir/vllm.pid")
