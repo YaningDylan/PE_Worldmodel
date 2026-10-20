@@ -44,6 +44,7 @@ loop:
   tau: 1.0
   belief_cap: 30
   init_belief: null            # path to a B json to start from
+  belief_to_generator: true    # also show B (when non-empty) in the Generator prompt; false = Estimator only
   parse_retries: 1             # Estimator / Librarian; the Generator is never retried
   estimator_diff_lines: 600
   librarian_diff_lines: 150

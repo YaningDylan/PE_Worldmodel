@@ -2,7 +2,7 @@
 - Fitness: {{fitness}}
 - Focus areas: {{focus_areas}}
 
-{{artifacts}}
+{{artifacts}}{{belief_section}}
 
 # Program Evolution History
 ## Previous Attempts

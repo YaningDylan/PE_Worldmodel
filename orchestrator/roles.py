@@ -236,9 +236,10 @@ def _unique_features(p: Program, limit: int = 3) -> str:
 
 
 def generator_prompt(rr: RoleRunner, parent: Program, inspirations: list[Program], island_top: list[Program],
-                     rng, cfg: dict) -> tuple[str, str]:
+                     rng, cfg: dict, belief: BeliefDoc | None = None) -> tuple[str, str]:
     """(system, user). island_top: the parent island's programs by score (OpenEvolve: previous attempts = top
-    num_top; top programs = top num_top + num_diverse, of which the last num_diverse are sampled as 'diverse')."""
+    num_top; top programs = top num_top + num_diverse, of which the last num_diverse are sampled as 'diverse').
+    belief: shown after the execution output when non-empty; None or empty leaves the OpenEvolve prompt as is."""
     nt, nd = int(cfg["num_top_programs"]), int(cfg["num_diverse_programs"])
     prev, top = island_top[:nt], island_top[:nt + nd]
     areas = []
@@ -278,8 +279,8 @@ def generator_prompt(rr: RoleRunner, parent: Program, inspirations: list[Program
     system = render("generator_system", problem=rr.problem)
     user = render("generator", fitness=f"{parent.score:.4f}", focus_areas="\n".join(f"- {a}" for a in areas),
                   artifacts=render_artifacts(parent.artifacts, int(cfg.get("max_artifact_chars", 20480))),
-                  previous_attempts="\n\n".join(attempts), top_programs=top_txt, inspirations=insp_txt,
-                  code=parent.code)
+                  belief_section=generator_belief_section(belief), previous_attempts="\n\n".join(attempts),
+                  top_programs=top_txt, inspirations=insp_txt, code=parent.code)
     return system, user
 
 
@@ -300,6 +301,16 @@ def belief_section(belief: BeliefDoc | None) -> str:
         return ""
     return ("\n## Belief document (lessons recorded so far about which modifications change the "
             "score and by how much; it may be incomplete or wrong)\n" + belief.render() + "\n")
+
+
+def generator_belief_section(belief: BeliefDoc | None) -> str:
+    """B for the Generator prompt; "" (prompt unchanged) when B is None or has no beliefs. The section carries
+    its own leading blank line; the template's blank line after it separates it from the next heading."""
+    if belief is None or len(belief) == 0:
+        return ""
+    return ("\n\n# Lessons Learned So Far\nThese beliefs were recorded by comparing predicted and actual score "
+            "changes of earlier modifications in this run. They may be incomplete or wrong; use them as guidance, "
+            "not as rules.\n" + belief.render())
 
 
 def parse_estimate(text: str) -> dict:

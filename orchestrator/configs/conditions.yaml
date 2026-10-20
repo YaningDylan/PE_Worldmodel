@@ -1,11 +1,17 @@
-# Conditions. Only `loop` keys differ; the Generator prompt is the same in all of them.
+# Conditions. Only `loop` keys differ. The Generator prompt is the same in all of them, except that pe and
+# pe_labeled also show it B (belief_to_generator, on by default); the *_gate_only variants show B to the
+# Estimator only, and the conditions without B turn it off explicitly.
 vanilla:       # OpenEvolve-style search, one candidate per iteration
-  loop: {N: 1, select: single, use_estimator: false, update_rule: never, eval_all: false}
+  loop: {N: 1, select: single, use_estimator: false, update_rule: never, eval_all: false, belief_to_generator: false}
 pe:            # N candidates -> stage 1 -> Estimator (reads B) -> argmax delta_hat; Librarian updates B
-  loop: {N: 4, select: argmax, use_estimator: true, update_rule: error, eval_all: false}
+  loop: {N: 4, select: argmax, use_estimator: true, update_rule: error, eval_all: false, belief_to_generator: true}
 pe_labeled:    # pe + full evaluation of every stage-1 passer and empty-B estimates (logged, not used)
-  loop: {N: 4, select: argmax, use_estimator: true, update_rule: error, eval_all: true}
+  loop: {N: 4, select: argmax, use_estimator: true, update_rule: error, eval_all: true, belief_to_generator: true}
+pe_gate_only:  # pe without B in the Generator prompt
+  loop: {N: 4, select: argmax, use_estimator: true, update_rule: error, eval_all: false, belief_to_generator: false}
+pe_labeled_gate_only:  # pe_labeled without B in the Generator prompt
+  loop: {N: 4, select: argmax, use_estimator: true, update_rule: error, eval_all: true, belief_to_generator: false}
 random_of_n:   # N candidates -> stage 1 -> uniform choice among passers
-  loop: {N: 4, select: random, use_estimator: false, update_rule: never, eval_all: false}
+  loop: {N: 4, select: random, use_estimator: false, update_rule: never, eval_all: false, belief_to_generator: false}
 wm_nob:        # pe with B kept empty and the Librarian disabled
-  loop: {N: 4, select: argmax, use_estimator: true, update_rule: never, eval_all: false}
+  loop: {N: 4, select: argmax, use_estimator: true, update_rule: never, eval_all: false, belief_to_generator: false}

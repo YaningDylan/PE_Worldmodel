@@ -2,7 +2,8 @@
 
 Iteration t works on island t % num_islands:
   parent, inspirations = db.sample(island)           (OpenEvolve's storage and sampling, db.py)
-  the Generator prompt is built from them (identical in every condition; B is never shown to the Generator)
+  the Generator prompt is built from them; with loop.belief_to_generator it also shows B (when non-empty),
+  otherwise it is the same in every condition
   N candidates: independent generations from that prompt, SEARCH/REPLACE diffs applied to the parent
   stage 1: compile + the 5 smallest public cases, for every candidate whose diff applied
   select:  single (vanilla, N = 1) | argmax of the Estimator's delta_hat over stage-1 passers (PE) |
@@ -195,8 +196,9 @@ class EvolveLoop:
         parent, insp, mode = db.sample(island)
         pc = self.cfg["prompt"]
         top = db.top(parent.island, int(pc["num_top_programs"]) + int(pc["num_diverse_programs"]))
+        gen_b = self.belief if lp.get("belief_to_generator") and len(self.belief) > 0 else None
         system, user = roles.generator_prompt(self.rr, parent, insp, top, random.Random(stable_seed(
-            self.seed, t, "prompt")), pc)
+            self.seed, t, "prompt")), pc, gen_b)
         N, max_len = int(lp["N"]), int(pc["max_code_length"])
         gens = _pmap(lambda i: roles.generate(self.rr, system, user, parent.code, i, max_len), range(N))
         timing["generate_s"] = time.time() - tick
@@ -266,7 +268,8 @@ class EvolveLoop:
                "parent": {"id": parent.id, "score": parent.score, "island": parent.island, "status": parent.status,
                           "migrant": parent.migrant, "hash": parent.code_hash},
                "inspiration_ids": [p.id for p in insp], "prompt_top_ids": [p.id for p in top],
-               "B_version": self.belief.version, "N": N, "selection_rule": how, "selected_idx": None,
+               "B_version": self.belief.version, "gen_B_version": gen_b.version if gen_b is not None else None,
+               "N": N, "selection_rule": how, "selected_idx": None,
                "child": None, "delta_hat": None, "delta": None, "e": None, "budget_used": 0,
                "librarian": {"fired": False}, "migrated": False, "infra": infra_ids()}
         child, new_b = None, None
